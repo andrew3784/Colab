@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +14,7 @@ from rasterio.features import shapes
 from rasterio.mask import mask
 from rasterio.merge import merge
 from rasterio.warp import transform_geom
+from scipy import ndimage
 from shapely.geometry import shape
 from shapely.ops import unary_union
 from sqlalchemy import text
@@ -102,23 +103,42 @@ def filter_products_by_title(products: Iterable[dict], title_contains: str | Non
     return [product for product in products if needle in (product.get("title") or "").lower()]
 
 
-def download_products(products: Iterable[dict], output_dir: Path) -> list[Path]:
+def _download_product(product: dict, output_dir: Path) -> Path:
+    url = product.get("downloadURL") or product.get("urls", {}).get("TIFF")
+    if not url:
+        raise RuntimeError(f"No GeoTIFF download URL found for {product.get('title')}")
+    output_path = output_dir / Path(url).name
+    expected_size = product.get("sizeInBytes")
+    if output_path.exists() and (not expected_size or output_path.stat().st_size == expected_size):
+        return output_path
+
+    partial_path = output_path.with_suffix(f"{output_path.suffix}.part")
+    offset = partial_path.stat().st_size if partial_path.exists() else 0
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    with requests.get(url, stream=True, timeout=(30, 600), headers=headers) as response:
+        if offset and response.status_code != 206:
+            offset = 0
+            partial_path.unlink(missing_ok=True)
+        response.raise_for_status()
+        mode = "ab" if offset else "wb"
+        with partial_path.open(mode) as file:
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    file.write(chunk)
+    if expected_size and partial_path.stat().st_size != expected_size:
+        raise RuntimeError(
+            f"Downloaded size mismatch for {product.get('title')}: "
+            f"expected {expected_size}, got {partial_path.stat().st_size}"
+        )
+    partial_path.replace(output_path)
+    return output_path
+
+
+def download_products(products: Iterable[dict], output_dir: Path, workers: int = 1) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
-    for product in products:
-        url = product.get("downloadURL") or product.get("urls", {}).get("TIFF")
-        if not url:
-            raise RuntimeError(f"No GeoTIFF download URL found for {product.get('title')}")
-        output_path = output_dir / Path(url).name
-        if not output_path.exists():
-            with requests.get(url, stream=True, timeout=120) as response:
-                response.raise_for_status()
-                with output_path.open("wb") as file:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            file.write(chunk)
-        paths.append(output_path)
-    return paths
+    product_list = list(products)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(lambda product: _download_product(product, output_dir), product_list))
 
 
 def clip_dem_to_study_area(engine: Engine, study_area_id: str, input_paths: list[Path], output_path: Path) -> None:
@@ -192,49 +212,24 @@ def flood_depth_from_dem(
 
 
 def boundary_connected_wet_mask(wet: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    rows, cols = wet.shape
-    connected = np.zeros(wet.shape, dtype=bool)
-    queue: deque[tuple[int, int]] = deque()
-    for col in range(cols):
-        if wet[0, col]:
-            queue.append((0, col))
-        if rows > 1 and wet[rows - 1, col]:
-            queue.append((rows - 1, col))
-    for row in range(rows):
-        if wet[row, 0]:
-            queue.append((row, 0))
-        if cols > 1 and wet[row, cols - 1]:
-            queue.append((row, cols - 1))
-    for row in range(rows):
-        for col in range(cols):
-            if not wet[row, col]:
-                continue
-            for row_offset in (-1, 0, 1):
-                for col_offset in (-1, 0, 1):
-                    if row_offset == 0 and col_offset == 0:
-                        continue
-                    next_row = row + row_offset
-                    next_col = col + col_offset
-                    if 0 <= next_row < rows and 0 <= next_col < cols and not valid[next_row, next_col]:
-                        queue.append((row, col))
-                        break
-                else:
-                    continue
-                break
-    while queue:
-        row, col = queue.popleft()
-        if connected[row, col] or not wet[row, col]:
-            continue
-        connected[row, col] = True
-        for row_offset in (-1, 0, 1):
-            for col_offset in (-1, 0, 1):
-                if row_offset == 0 and col_offset == 0:
-                    continue
-                next_row = row + row_offset
-                next_col = col + col_offset
-                if 0 <= next_row < rows and 0 <= next_col < cols and wet[next_row, next_col] and not connected[next_row, next_col]:
-                    queue.append((next_row, next_col))
-    return connected
+    if wet.shape != valid.shape:
+        raise ValueError("wet and valid masks must have the same shape")
+    if wet.ndim != 2:
+        raise ValueError("wet and valid masks must be two-dimensional")
+    if not wet.any():
+        return np.zeros(wet.shape, dtype=bool)
+
+    structure = np.ones((3, 3), dtype=bool)
+    seeds = wet & ndimage.binary_dilation(~valid, structure=structure)
+    seeds[0, :] |= wet[0, :]
+    seeds[-1, :] |= wet[-1, :]
+    seeds[:, 0] |= wet[:, 0]
+    seeds[:, -1] |= wet[:, -1]
+
+    labels, _ = ndimage.label(wet, structure=structure)
+    connected_labels = np.unique(labels[seeds])
+    connected_labels = connected_labels[connected_labels != 0]
+    return np.isin(labels, connected_labels, assume_unique=True)
 
 
 def connected_depth_raster(source_path: Path, output_path: Path, min_depth_ft: float = 0.0) -> ConnectedDepthStats:

@@ -10,7 +10,7 @@ from flood_analysis.exposure import upsert_file_buildings
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest local building footprints clipped to a study area.")
     parser.add_argument("--study-area-id", default="norfolk_va")
-    parser.add_argument("--input", type=Path, required=True, help="GeoPackage, GeoJSON, or Shapefile path.")
+    parser.add_argument("--input", type=Path, required=True, help="GeoParquet, GeoPackage, GeoJSON, or Shapefile path.")
     parser.add_argument("--layer", help="Optional layer name for multi-layer files such as GeoPackage.")
     parser.add_argument("--id-column", help="Optional stable building ID column. Defaults to generated file index IDs.")
     parser.add_argument("--name-column", help="Optional building/name column.")

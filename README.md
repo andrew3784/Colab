@@ -1,16 +1,53 @@
-
 # Hampton Roads Flood Analysis, Old Dominion Univ., Summer 2026
 
-Andrew Mounsey amounsey@odu.edu 
+Andrew Mounsey amounsey@odu.edu
 
 Ryan Thompson rthom035@odu.com
 
 Scott Zumwalt jzum001@odu.edu
 
+Python-first workflow for ingesting NOAA water-level data, storing project data in PostgreSQL/PostGIS, creating flood-depth rasters, calculating road/building exposure, and exporting GIS-ready outputs for ArcGIS or QGIS.
 
-Python-first workflow for ingesting NOAA water-level data, storing project data in Postgres/PostGIS, and producing GIS-ready flood-analysis outputs for ArcGIS.
+## What This Produces
+
+The active Norfolk workflow produces:
+
+- NOAA-derived flood scenarios for Sewells Point station `8638610`.
+- A Norfolk study-area boundary in PostGIS.
+- A clipped USGS 3DEP 1-meter DEM for Norfolk.
+- Four flood-depth GeoTIFFs for current, `+1 ft`, `+2 ft`, and `+3 ft` sea-level-rise scenarios.
+- Four connectivity-filtered flood-depth GeoTIFFs and vector flood extents.
+- TIGER road exposure tables and summaries.
+- Overture building-footprint exposure tables and summaries.
+- A GeoPackage and summary CSV files for GIS review.
+
+## Before You Start
+
+Run commands from the repository root:
+
+```bash
+pwd
+```
+
+Expected location:
+
+```text
+/home/rthomson/odu/cs620/project
+```
+
+You need:
+
+- Python `3.9` or newer.
+- PostgreSQL with PostGIS enabled.
+- A `.env` file containing `DATABASE_URL`.
+- Internet access for NOAA, USGS, TIGER, and Overture downloads.
+- Enough local disk space for source DEM tiles, derived rasters, and GIS exports. Budget at least `20-30 GB` for a full rerun.
+
+Large data files are intentionally kept on disk as GeoTIFF, Parquet, GeoPackage, or CSV files. PostGIS stores scenario metadata, vector layers, exposure tables, and raster file paths.
 
 ## Setup
+
+Create a virtual environment and install the project:
 
 ```bash
 python -m venv .venv
@@ -19,35 +56,43 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-Keep database credentials in `.env`:
+Create `.env` in the repository root:
 
 ```bash
 DATABASE_URL=postgresql+psycopg://user:password@host:5432/database
 ```
 
-## Verify PostGIS
+Use the SQLAlchemy/psycopg URL format shown above. Do not commit `.env`.
+
+## Quick Health Check
+
+Verify PostGIS first:
 
 ```bash
 python scripts/check_postgis.py
 ```
 
-If that fails, check the connected user's privileges:
+If that fails, inspect the connected user's privileges:
 
 ```bash
 python scripts/check_db_privileges.py
 ```
 
-The database owner may need to run `sql/bootstrap.sql` or grant this user permission to create schemas/tables.
+The database owner may need to run `sql/bootstrap.sql`, enable the PostGIS extension, or grant this user permission to create schemas and tables.
 
-## Initialize Tables
+Initialize project schemas and tables:
 
 ```bash
 python scripts/init_db.py
 ```
 
-## Ingest NOAA Water Levels
+## Full Run Order
 
-If database writes are not available yet, fetch NOAA data to CSV:
+Run the sections below in order for a clean end-to-end rebuild. Some steps are safe to rerun because they upsert rows or overwrite/register outputs, but the cleanest mental model is still top-to-bottom execution.
+
+## 1. Ingest NOAA Water Levels
+
+If database writes are not available yet, you can fetch NOAA data to CSV only:
 
 ```bash
 python scripts/fetch_noaa_water_levels.py \
@@ -56,9 +101,7 @@ python scripts/fetch_noaa_water_levels.py \
   --end-date 20260628
 ```
 
-Once database permissions are ready, write the same NOAA data into PostGIS.
-
-Example using Sewells Point, VA (`8638610`):
+For the normal workflow, write observations and station metadata to PostGIS:
 
 ```bash
 python scripts/ingest_noaa_water_levels.py \
@@ -70,11 +113,11 @@ python scripts/ingest_noaa_water_levels.py \
   --interval 6
 ```
 
-The script writes observations to `raw.noaa_water_levels` and stores station metadata in `raw.noaa_stations`.
+This writes observations to `raw.noaa_water_levels` and station metadata to `raw.noaa_stations`.
 
-## Create Norfolk Pilot Scenarios
+## 2. Create Flood Scenarios
 
-After NOAA observations are ingested, create flood scenarios from the peak observed water level. The default sea-level-rise variants are current conditions plus `1`, `2`, and `3` feet.
+Create scenarios from the peak observed water level. The default sea-level-rise variants are current conditions plus `1`, `2`, and `3` feet.
 
 ```bash
 python scripts/create_peak_scenarios.py \
@@ -83,30 +126,19 @@ python scripts/create_peak_scenarios.py \
   --study-area "Norfolk pilot"
 ```
 
-This writes rows to `processed.flood_scenarios`, including:
+This writes rows to `processed.flood_scenarios`.
 
-```text
-peak_water_level
-peak_observed_at
-sea_level_rise_ft
-water_surface_elevation
-datum
-units
-study_area
-method
-```
+## 3. Convert Scenarios To NAVD88
 
-Current caveat: the first scenarios use NOAA `MLLW` values because that is how the sample data was ingested. Do not compare these directly to a DEM unless the DEM and water levels have been converted to the same vertical datum, usually `NAVD88`.
+The NOAA water levels above are ingested in `MLLW`. Convert them before comparing to the DEM.
 
-## Convert Scenarios To NAVD88
-
-Ingest NOAA station datum offsets:
+Ingest station datum offsets:
 
 ```bash
 python scripts/ingest_noaa_datums.py --station 8638610
 ```
 
-Convert scenario water surfaces from `MLLW` to `NAVD88` using the station offsets:
+Convert scenario water surfaces from `MLLW` to `NAVD88`:
 
 ```bash
 python scripts/convert_scenarios_datum.py \
@@ -115,20 +147,9 @@ python scripts/convert_scenarios_datum.py \
   --target-datum NAVD88
 ```
 
-For Sewells Point (`8638610`), NOAA reports:
+Use `analysis_water_surface_elevation` and `analysis_datum` for DEM comparisons, not the original `water_surface_elevation` and `datum` fields.
 
-```text
-MLLW = 4.38 ft above station datum
-NAVD88 = 5.99 ft above station datum
-```
-
-So for this station epoch:
-
-```text
-NAVD88 elevation = MLLW water level - 1.61 ft
-```
-
-The Norfolk pilot scenarios currently resolve to:
+Current Norfolk pilot scenario elevations:
 
 ```text
 current peak: 1.536 ft NAVD88
@@ -137,9 +158,7 @@ current peak: 1.536 ft NAVD88
 +3 ft SLR:    4.536 ft NAVD88
 ```
 
-Use `analysis_water_surface_elevation` and `analysis_datum` for DEM comparisons, not the original `water_surface_elevation` and `datum` fields.
-
-## Ingest Norfolk Study Area
+## 4. Ingest Norfolk Study Area
 
 Load the Norfolk city boundary from US Census TIGER/Line county-equivalent boundaries:
 
@@ -150,44 +169,262 @@ python scripts/ingest_study_area.py \
   --name "Norfolk, VA"
 ```
 
-This writes a valid `MultiPolygon` to `processed.study_areas`. The current Norfolk pilot geometry is approximately:
+This writes a valid `MultiPolygon` to `processed.study_areas`.
+
+Current Norfolk geometry summary:
 
 ```text
 249.68 sq km
 96.40 sq mi
 ```
 
-Use this geometry to clip DEM/elevation rasters and to constrain later exposure overlays.
+## 5. Download And Clip The 1-Meter DEM
 
-## Download And Clip DEM
+The active exposure workflow uses USGS 3DEP 1-meter products. The recommended product set is `VA_HamptonRoads_B23`, published `2026-03-24`.
 
-The pilot DEM workflow uses USGS 3DEP through The National Map API. The default script uses 1 arc-second GeoTIFFs because they are small enough for quick iteration. For final exposure mapping, prefer a higher-resolution lidar-derived DEM if schedule and storage allow.
+Search for matching tiles:
 
-Search for intersecting DEM tiles:
+```bash
+python scripts/download_usgs_dem.py \
+  --study-area-id norfolk_va \
+  --dataset "Digital Elevation Model (DEM) 1 meter" \
+  --title-contains VA_HamptonRoads_B23 \
+  --max-results 100
+```
+
+Expected search result:
+
+```text
+product_count=9
+total_bytes=2361737796
+```
+
+Download the tiles with resumable, size-validated transfers:
+
+```bash
+python scripts/download_usgs_dem.py \
+  --study-area-id norfolk_va \
+  --dataset "Digital Elevation Model (DEM) 1 meter" \
+  --title-contains VA_HamptonRoads_B23 \
+  --max-results 100 \
+  --output-dir data/raw/usgs_3dep_1m \
+  --workers 4 \
+  --download
+```
+
+Clip and mosaic the downloaded tiles to Norfolk:
+
+```bash
+python scripts/clip_dem_to_study_area.py \
+  --study-area-id norfolk_va \
+  --input-dem data/raw/usgs_3dep_1m/*.tif \
+  --output data/processed/dem/norfolk_va_usgs_1m_hamptonroads_b23_navd88_m.tif
+```
+
+Current clipped 1-meter DEM validation:
+
+```text
+crs=EPSG:26918
+resolution=1x1 meter
+shape=24284x19010
+valid_pixels=176426700
+nodata=-999999.0
+min_m=-7.605
+max_m=21.083
+mean_m=2.443
+```
+
+## 6. Create Flood-Depth Rasters
+
+Create one high-resolution flood-depth GeoTIFF per NAVD88 scenario:
+
+```bash
+python scripts/create_flood_depth_rasters.py \
+  --study-area-id norfolk_va \
+  --dem data/processed/dem/norfolk_va_usgs_1m_hamptonroads_b23_navd88_m.tif \
+  --dem-units meters \
+  --output-dir data/processed/flood_depths_1m
+```
+
+The script registers raster paths and summary stats in `results.flood_depth_rasters`.
+
+## 7. Create Connected Flood Products
+
+First polygonize the unfiltered flood-depth rasters. The export step writes this baseline `flood_extents` layer, and the connected products below are compared against it.
+
+```bash
+python scripts/polygonize_flood_extents.py --min-depth-ft 0
+```
+
+Create connected-depth rasters from the flood-depth rasters:
+
+```bash
+python scripts/create_connected_flood_depth_rasters.py \
+  --output-dir data/processed/flood_depths_connected_1m \
+  --min-depth-ft 0
+```
+
+This keeps wet cells connected by 8-neighbor connectivity to the raster edge or clipped study-area/nodata boundary. It removes isolated low depressions that are not connected to the modeled boundary water source.
+
+Polygonize the connected rasters into PostGIS vector extents:
+
+```bash
+python scripts/polygonize_connected_flood_extents.py --min-depth-ft 0
+```
+
+This writes vector extents to `processed.connected_flood_extents` and preserves the unfiltered bathtub extents in `processed.flood_extents`.
+
+Connectivity caveat: this is a screening-level boundary-connectivity filter, not a hydrodynamic model. It does not simulate flow paths, culverts, barriers, drainage, tide timing, or wave effects.
+
+## 8. Calculate Road Exposure
+
+Ingest Census TIGER roads clipped to Norfolk:
+
+```bash
+python scripts/ingest_roads.py \
+  --study-area-id norfolk_va \
+  --geoid 51710
+```
+
+Calculate road exposure against the unfiltered baseline extents:
+
+```bash
+python scripts/calculate_road_exposure.py --study-area-id norfolk_va
+```
+
+Then calculate road exposure against connectivity-filtered extents:
+
+```bash
+python scripts/calculate_road_exposure.py \
+  --study-area-id norfolk_va \
+  --connected
+```
+
+The first command writes unfiltered impacts to `results.road_flood_impacts` and `results.road_exposure_summary`. The second command writes connected impacts to `results.connected_road_flood_impacts` and `results.connected_road_exposure_summary`.
+
+Current connected road exposure summary:
+
+```text
+road_count=6663
+connected_road_impact_rows=823
+
+current peak: flooded_road_count=73  flooded_length_mi=12.439
++1 ft SLR:    flooded_road_count=113 flooded_length_mi=13.724
++2 ft SLR:    flooded_road_count=215 flooded_length_mi=19.770
++3 ft SLR:    flooded_road_count=422 flooded_length_mi=43.972
+```
+
+Road exposure caveats:
+
+- TIGER roads are a generalized public baseline, not a routable transportation network.
+- The connected outputs reduce disconnected-depression artifacts but are still screening-level.
+- Use VGIN/local centerlines before making transportation decisions.
+
+## 9. Download And Ingest Building Footprints
+
+The current building source is Overture Maps release `2026-06-17.0`. Download Norfolk bounding-box candidates from Overture GeoParquet with DuckDB:
+
+```bash
+python scripts/download_overture_buildings.py \
+  --study-area-id norfolk_va \
+  --output data/raw/overture/norfolk_buildings.parquet
+```
+
+The extract contains `141441` candidates. Exact clipping to the Norfolk study area loads `83891` footprints:
+
+```bash
+python scripts/ingest_buildings_from_file.py \
+  --study-area-id norfolk_va \
+  --input data/raw/overture/norfolk_buildings.parquet \
+  --id-column id \
+  --name-column name \
+  --type-column building_type \
+  --source "Overture Maps 2026-06-17.0"
+```
+
+This writes footprints to `processed.buildings`.
+
+Alternative local footprint files are also supported:
+
+```bash
+python scripts/ingest_buildings_from_file.py \
+  --study-area-id norfolk_va \
+  --input path/to/building_footprints.gpkg \
+  --layer buildings \
+  --id-column building_id \
+  --name-column name \
+  --type-column building_type \
+  --source "Local building footprints"
+```
+
+Experimental OSM ingestion exists, but the full Norfolk OSM/Overpass import is large and timed out in this environment. Prefer Overture or a local file for reliable runs.
+
+## 10. Calculate Building Exposure
+
+After buildings and connected rasters exist, calculate building exposure:
+
+```bash
+python scripts/calculate_building_exposure.py --study-area-id norfolk_va
+```
+
+This writes feature-level impacts to `results.connected_building_flood_impacts` and scenario summaries to `results.connected_building_exposure_summary`.
+
+Current 1-meter connected building exposure summary:
+
+```text
+processed.buildings=83891
+connected_building_impact_rows=2650
+
+current peak: flooded_building_count=169  flooded_footprint_area_m2=133363.3
++1 ft SLR:    flooded_building_count=196  flooded_footprint_area_m2=136707.9
++2 ft SLR:    flooded_building_count=512  flooded_footprint_area_m2=166650.7
++3 ft SLR:    flooded_building_count=1773 flooded_footprint_area_m2=307445.4
+```
+
+Each reported building has a positive maximum depth sampled from its connected 1-meter raster. Polygon-only sliver contacts without a wet raster pixel are excluded.
+
+## 11. Export GIS Deliverables
+
+Export GIS layers for ArcGIS or QGIS review:
+
+```bash
+python scripts/export_gis_layers.py \
+  --study-area-id norfolk_va \
+  --output data/processed/gis/norfolk_flood_exposure_1m.gpkg
+```
+
+The GeoPackage currently contains these layers when all prior steps have run:
+
+```text
+roads
+flood_extents
+road_flood_impacts
+connected_flood_extents
+connected_road_flood_impacts
+buildings
+connected_building_flood_impacts
+```
+
+The export also writes adjacent road and building scenario-summary CSV files.
+
+## Optional Coarse Baseline Workflow
+
+The original 1 arc-second DEM workflow is retained as a lightweight baseline. Use it for quick testing, not final exposure outputs.
+
+Search and download coarse USGS 3DEP tiles:
 
 ```bash
 python scripts/download_usgs_dem.py \
   --study-area-id norfolk_va \
   --dataset "National Elevation Dataset (NED) 1 arc-second"
-```
 
-Download the latest GeoTIFF for each intersecting tile:
-
-```bash
 python scripts/download_usgs_dem.py \
   --study-area-id norfolk_va \
   --dataset "National Elevation Dataset (NED) 1 arc-second" \
   --download
 ```
 
-Current Norfolk pilot tiles:
-
-```text
-data/raw/usgs_3dep/USGS_1_n37w077_20260324.tif
-data/raw/usgs_3dep/USGS_1_n38w077_20260324.tif
-```
-
-Clip/merge the tiles to the Norfolk boundary:
+Clip the coarse DEM:
 
 ```bash
 python scripts/clip_dem_to_study_area.py \
@@ -198,7 +435,19 @@ python scripts/clip_dem_to_study_area.py \
   --output data/processed/dem/norfolk_va_usgs_1arcsec_navd88_m.tif
 ```
 
-Current clipped DEM validation:
+Create coarse flood-depth rasters and connected products with the default output directories:
+
+```bash
+python scripts/create_flood_depth_rasters.py \
+  --study-area-id norfolk_va \
+  --dem data/processed/dem/norfolk_va_usgs_1arcsec_navd88_m.tif \
+  --dem-units meters
+
+python scripts/create_connected_flood_depth_rasters.py --min-depth-ft 0
+python scripts/polygonize_connected_flood_extents.py --min-depth-ft 0
+```
+
+Current clipped coarse DEM validation:
 
 ```text
 path=data/processed/dem/norfolk_va_usgs_1arcsec_navd88_m.tif
@@ -212,292 +461,33 @@ max_m=20.738
 mean_m=1.717
 ```
 
-## Higher-Resolution DEM Option
-
-USGS 3DEP 1-meter products are available for Norfolk. The recommended local product set is `VA_HamptonRoads_B23`, published `2026-03-24`.
-
-Search for the preferred 1-meter tiles:
-
-```bash
-python scripts/download_usgs_dem.py \
-  --study-area-id norfolk_va \
-  --dataset "Digital Elevation Model (DEM) 1 meter" \
-  --title-contains VA_HamptonRoads_B23 \
-  --max-results 100
-```
-
-Current search result:
+Coarse versus 1-meter connected-road comparison:
 
 ```text
-product_count=9
-total_bytes=2361737796
+current peak: coarse=13.397 mi 1-meter=12.439 mi
++1 ft SLR:    coarse=15.506 mi 1-meter=13.724 mi
++2 ft SLR:    coarse=20.627 mi 1-meter=19.770 mi
++3 ft SLR:    coarse=38.910 mi 1-meter=43.972 mi
 ```
 
-Download the preferred 1-meter tiles when storage/time allow:
-
-```bash
-python scripts/download_usgs_dem.py \
-  --study-area-id norfolk_va \
-  --dataset "Digital Elevation Model (DEM) 1 meter" \
-  --title-contains VA_HamptonRoads_B23 \
-  --max-results 100 \
-  --output-dir data/raw/usgs_3dep_1m \
-  --download
-```
-
-Then clip to Norfolk:
-
-```bash
-python scripts/clip_dem_to_study_area.py \
-  --study-area-id norfolk_va \
-  --input-dem data/raw/usgs_3dep_1m/*.tif \
-  --output data/processed/dem/norfolk_va_usgs_1m_hamptonroads_b23_navd88_m.tif
-```
-
-After clipping, rerun the depth, connectivity, road exposure, and GIS export steps with the 1-meter DEM. This should be the preferred path for final maps and exposure tables.
-
-Intermediate option: 1/3 arc-second 3DEP is also available, but the current Norfolk search returns two tiles totaling about `823 MB`. If storage is available, use the 1-meter Hampton Roads product instead.
-
-## Create Flood-Depth Rasters
-
-Create one flood-depth GeoTIFF per NAVD88 scenario:
-
-```bash
-python scripts/create_flood_depth_rasters.py \
-  --study-area-id norfolk_va \
-  --dem data/processed/dem/norfolk_va_usgs_1arcsec_navd88_m.tif \
-  --dem-units meters
-```
-
-Outputs are written under:
-
-```text
-data/processed/flood_depths/
-```
-
-Raster paths and summary stats are also registered in `results.flood_depth_rasters`.
-
-Current depth-raster summary:
-
-```text
-current peak: wet_pixels=144850 max_depth_ft=13.381 mean_depth_ft=2.232
-+1 ft SLR:    wet_pixels=147290 max_depth_ft=14.381 mean_depth_ft=3.187
-+2 ft SLR:    wet_pixels=150076 max_depth_ft=15.381 mean_depth_ft=4.118
-+3 ft SLR:    wet_pixels=155142 max_depth_ft=16.381 mean_depth_ft=4.968
-```
-
-## Polygonize Flood Extents
-
-Convert wet pixels from registered depth rasters into vector flood extents:
-
-```bash
-python scripts/polygonize_flood_extents.py --min-depth-ft 0
-```
-
-This writes scenario polygons to `processed.flood_extents`, which is useful for fast map display and later exposure overlays.
-
-Current vector extent summary:
-
-```text
-current peak: valid=True area_sq_km=110.464 max_depth_ft=13.381
-+1 ft SLR:    valid=True area_sq_km=112.326 max_depth_ft=14.381
-+2 ft SLR:    valid=True area_sq_km=114.452 max_depth_ft=15.381
-+3 ft SLR:    valid=True area_sq_km=118.319 max_depth_ft=16.381
-```
-
-ArcGIS/QGIS can read the GeoTIFF depth rasters directly from `data/processed/flood_depths/`. Vector extents can be loaded from PostGIS table `processed.flood_extents`.
-
-Important limitation: the current depth and extent products are a simple bathtub model. They include low inland depressions and existing water areas unless filtered later. Add hydrologic connectivity filtering before treating these as final inundation extents.
-
-## Connectivity-Filtered Flood Extents
-
-Create connected flood-depth rasters from the bathtub depth rasters:
-
-```bash
-python scripts/create_connected_flood_depth_rasters.py --min-depth-ft 0
-```
-
-This keeps wet cells connected by 8-neighbor connectivity to either the raster edge or the clipped study-area/nodata boundary. It removes isolated low depressions that are not connected to the modeled boundary water source.
-
-Connected depth rasters are written under:
-
-```text
-data/processed/flood_depths_connected/
-```
-
-Raster metadata and removed-pixel counts are registered in `results.connected_flood_depth_rasters`.
-
-Current connected raster summary:
-
-```text
-current peak: wet_pixels=143580 removed_wet_pixels=1270
-+1 ft SLR:    wet_pixels=145546 removed_wet_pixels=1744
-+2 ft SLR:    wet_pixels=147370 removed_wet_pixels=2706
-+3 ft SLR:    wet_pixels=151783 removed_wet_pixels=3359
-```
-
-Polygonize connected rasters:
-
-```bash
-python scripts/polygonize_connected_flood_extents.py --min-depth-ft 0
-```
-
-This writes vector extents to `processed.connected_flood_extents` while preserving the original bathtub extents in `processed.flood_extents`.
-
-Connectivity caveat: this is a screening-level boundary-connectivity filter, not a hydrodynamic model. It does not simulate flow paths, culverts, barriers, drainage, tide timing, or wave effects.
-
-## Exposure Layers To Add Next
-
-## Road Exposure Analysis
-
-Ingest Census TIGER roads clipped to the Norfolk study area:
-
-```bash
-python scripts/ingest_roads.py \
-  --study-area-id norfolk_va \
-  --geoid 51710
-```
-
-Calculate flooded road length by scenario using `processed.flood_extents`:
-
-```bash
-python scripts/calculate_road_exposure.py --study-area-id norfolk_va
-```
-
-This writes feature-level impacts to `results.road_flood_impacts` and scenario summaries to `results.road_exposure_summary`.
-
-Calculate road exposure against connectivity-filtered extents:
-
-```bash
-python scripts/calculate_road_exposure.py \
-  --study-area-id norfolk_va \
-  --connected
-```
-
-This writes feature-level impacts to `results.connected_road_flood_impacts` and scenario summaries to `results.connected_road_exposure_summary`.
-
-Current Norfolk road exposure summary:
-
-```text
-road_count=6663
-bathtub_road_impact_rows=1437
-
-current peak: flooded_road_count=167 flooded_length_mi=16.256
-+1 ft SLR:    flooded_road_count=238 flooded_length_mi=19.759
-+2 ft SLR:    flooded_road_count=402 flooded_length_mi=27.178
-+3 ft SLR:    flooded_road_count=630 flooded_length_mi=50.172
-```
-
-Current connected road exposure summary:
-
-```text
-connected_road_impact_rows=1048
-
-current peak: flooded_road_count=121 flooded_length_mi=13.397
-+1 ft SLR:    flooded_road_count=179 flooded_length_mi=15.506
-+2 ft SLR:    flooded_road_count=280 flooded_length_mi=20.627
-+3 ft SLR:    flooded_road_count=468 flooded_length_mi=38.910
-```
-
-Bathtub versus connected comparison:
-
-```text
-current peak: bathtub=16.256 mi connected=13.397 mi
-+1 ft SLR:    bathtub=19.759 mi connected=15.506 mi
-+2 ft SLR:    bathtub=27.178 mi connected=20.627 mi
-+3 ft SLR:    bathtub=50.172 mi connected=38.910 mi
-```
-
-Export GIS layers for ArcGIS/QGIS review:
-
-```bash
-python scripts/export_gis_layers.py \
-  --study-area-id norfolk_va \
-  --output data/processed/gis/norfolk_flood_road_exposure.gpkg
-```
-
-The GeoPackage currently contains:
-
-```text
-roads
-flood_extents
-road_flood_impacts
-connected_flood_extents
-connected_road_flood_impacts
-```
-
-Road exposure caveats:
-
-- TIGER roads are a generalized public baseline, not a routable transportation network.
-- The connected outputs reduce disconnected-depression artifacts but are still screening-level.
-- Use VGIN/local centerlines and a higher-resolution DEM before final transportation conclusions.
-
-## Exposure Layers To Add Next
-
-Recommended next exposure layers for the Norfolk pilot:
-
-- Parcels/property: Norfolk or Virginia parcel data if licensing permits project use.
-- Critical facilities: hospitals, schools, emergency services, wastewater/power infrastructure.
-- Population/social vulnerability: Census blocks/block groups and CDC/ATSDR SVI.
-
-## Building Exposure Analysis
-
-Building exposure tables are available but no building footprint source has been loaded yet in the current database.
-
-Preferred ingestion path: use a local building footprint file from Norfolk open data, Microsoft/Overture, VGIN, or another licensed source.
-
-```bash
-python scripts/ingest_buildings_from_file.py \
-  --study-area-id norfolk_va \
-  --input path/to/building_footprints.gpkg \
-  --layer buildings \
-  --id-column building_id \
-  --name-column name \
-  --type-column building_type \
-  --source "Local building footprints"
-```
-
-The script clips footprints to `processed.study_areas.study_area_id = 'norfolk_va'` and writes them to `processed.buildings`.
-
-Experimental OSM ingestion is also available:
-
-```bash
-python scripts/ingest_buildings.py --study-area-id norfolk_va
-```
-
-The full Norfolk OSM/Overpass import is large and timed out in this environment, so use the file-based ingestion path for reliable project work.
-
-After buildings are loaded, calculate building exposure against connected flood extents:
-
-```bash
-python scripts/calculate_building_exposure.py --study-area-id norfolk_va
-```
-
-This writes feature-level impacts to `results.connected_building_flood_impacts` and scenario summaries to `results.connected_building_exposure_summary`.
-
-The GIS export script automatically includes these layers when building data exists:
-
-```text
-buildings
-connected_building_flood_impacts
-```
-
-Current building table status:
-
-```text
-processed.buildings=0
-results.connected_building_flood_impacts=0
-results.connected_building_exposure_summary=0
-```
+## Troubleshooting
+
+If setup or execution fails, check these first:
+
+- `DATABASE_URL` missing or malformed: confirm `.env` exists in the repository root and uses the `postgresql+psycopg://...` format.
+- PostGIS check fails: verify the database has PostGIS enabled and the user has schema/table privileges.
+- DEM download finds no products: rerun the search command and confirm the study area was ingested first.
+- DEM clip finds no files: confirm downloaded GeoTIFFs exist under `data/raw/usgs_3dep_1m/`.
+- Flood-depth creation finds no scenarios: rerun NOAA ingest, scenario creation, and NAVD88 conversion.
+- Connected products find no registered rasters: rerun `scripts/create_flood_depth_rasters.py` with the desired DEM/output directory.
+- Building exposure returns no rows: confirm `processed.buildings`, `processed.connected_flood_extents`, and `results.connected_flood_depth_rasters` are populated.
+- GIS export is missing building layers: run the building download, ingest, and exposure steps before exporting.
 
 ## Project Notes
 
-- Use PostGIS for shared vector/tabular data and scenario outputs.
-- Keep large DEM/flood-depth rasters as GeoTIFF files outside the database.
+- The 1-meter DEM workflow is the active workflow for exposure outputs.
+- The 1 arc-second DEM is retained only as a quick baseline.
 - Before comparing NOAA water levels against elevations, convert everything to a common vertical datum.
-- The initial pilot area is Norfolk so the DEM and exposure workflow stays small enough to validate before expanding region-wide.
-- The station datum conversion is appropriate for a screening-level project near Sewells Point/Norfolk. A larger Hampton Roads analysis should evaluate spatially varying tidal datums or VDatum.
-- The current 1 arc-second DEM is appropriate for workflow validation, not high-confidence parcel/building impacts.
-- Flood-depth rasters are stored as files; PostGIS stores scenario metadata, raster paths, stats, study areas, and vectorized flood extents.
-- Road exposure results are baseline screening outputs until the inundation layer is connectivity-filtered and road source quality is improved.
-- Connected flood extents are available as a better default for screening maps than raw bathtub extents, but both remain limited by the coarse DEM and simplified water-surface model.
+- The station datum conversion is appropriate for a screening-level project near Sewells Point/Norfolk. A broader Hampton Roads analysis should evaluate spatially varying tidal datums or VDatum.
+- Connected flood extents use the 1-meter DEM but remain a screening-level static water-surface model, not a hydrodynamic simulation.
+- Recommended next exposure layers are parcels/property, critical facilities, and population/social vulnerability.

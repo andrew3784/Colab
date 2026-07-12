@@ -4,7 +4,10 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+import rasterio
 import requests
+from rasterio.mask import mask as raster_mask
+from rasterio.warp import transform_geom
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.validation import make_valid
 from shapely.ops import unary_union
@@ -231,8 +234,11 @@ def file_buildings_for_study_area(
     name_column: str | None = None,
     type_column: str | None = None,
 ) -> gpd.GeoDataFrame:
-    kwargs = {"layer": layer} if layer else {}
-    source = gpd.read_file(input_path, **kwargs)
+    if input_path.suffix.lower() in {".parquet", ".geoparquet"}:
+        source = gpd.read_parquet(input_path)
+    else:
+        kwargs = {"layer": layer} if layer else {}
+        source = gpd.read_file(input_path, **kwargs)
     if source.crs is None:
         raise RuntimeError("Input building footprint file has no CRS. Define a CRS before ingesting.")
     source = source.to_crs(4326)
@@ -286,9 +292,9 @@ def upsert_buildings(engine: Engine, study_area_id: str, buildings: gpd.GeoDataF
     )
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM processed.buildings WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
+        batch = []
         for row in buildings.itertuples(index=False):
-            conn.execute(
-                query,
+            batch.append(
                 {
                     "study_area_id": study_area_id,
                     "building_id": row.building_id,
@@ -297,8 +303,13 @@ def upsert_buildings(engine: Engine, study_area_id: str, buildings: gpd.GeoDataF
                     "source": source,
                     "source_id": source_id,
                     "wkt": row.geometry.wkt,
-                },
+                }
             )
+            if len(batch) == 5000:
+                conn.execute(query, batch)
+                batch.clear()
+        if batch:
+            conn.execute(query, batch)
     return len(buildings)
 
 
@@ -329,26 +340,37 @@ def calculate_connected_building_flood_impacts(engine: Engine, study_area_id: st
         conn.execute(
             text(
                 """
+                WITH intersections AS MATERIALIZED (
+                    SELECT
+                        e.scenario_id,
+                        b.study_area_id,
+                        b.building_id,
+                        b.name,
+                        b.building_type,
+                        b.geom AS building_geom,
+                        ST_CollectionExtract(ST_Intersection(b.geom, e.geom), 3) AS flooded_geom
+                    FROM processed.buildings b
+                    JOIN processed.connected_flood_extents e
+                      ON ST_Intersects(b.geom, e.geom)
+                    WHERE b.study_area_id = :study_area_id
+                )
                 INSERT INTO results.connected_building_flood_impacts (
                     scenario_id, study_area_id, building_id, name, building_type,
                     footprint_area_m2, flooded_area_m2, flooded_area_fraction, max_depth_ft
                 )
                 SELECT
-                    e.scenario_id,
-                    b.study_area_id,
-                    b.building_id,
-                    b.name,
-                    b.building_type,
-                    ST_Area(b.geom::geography) AS footprint_area_m2,
-                    ST_Area(ST_Intersection(b.geom, e.geom)::geography) AS flooded_area_m2,
-                    ST_Area(ST_Intersection(b.geom, e.geom)::geography) / NULLIF(ST_Area(b.geom::geography), 0) AS flooded_area_fraction,
-                    e.max_depth_ft
-                FROM processed.buildings b
-                JOIN processed.connected_flood_extents e
-                    ON ST_Intersects(b.geom, e.geom)
-                WHERE b.study_area_id = :study_area_id
-                    AND NOT ST_IsEmpty(ST_Intersection(b.geom, e.geom))
-                    AND ST_Area(ST_Intersection(b.geom, e.geom)::geography) > 0
+                    scenario_id,
+                    study_area_id,
+                    building_id,
+                    name,
+                    building_type,
+                    ST_Area(building_geom::geography) AS footprint_area_m2,
+                    ST_Area(flooded_geom::geography) AS flooded_area_m2,
+                    ST_Area(flooded_geom::geography) / NULLIF(ST_Area(building_geom::geography), 0) AS flooded_area_fraction,
+                    NULL
+                FROM intersections
+                WHERE NOT ST_IsEmpty(flooded_geom)
+                  AND ST_Area(flooded_geom::geography) > 0
                 """
             ),
             {"study_area_id": study_area_id},
@@ -377,7 +399,97 @@ def calculate_connected_building_flood_impacts(engine: Engine, study_area_id: st
             ),
             {"study_area_id": study_area_id},
         )
+    sample_connected_building_depths(engine, study_area_id)
     return connected_building_exposure_summary(engine, study_area_id)
+
+
+def sample_connected_building_depths(engine: Engine, study_area_id: str) -> None:
+    raster_query = text(
+        """
+        SELECT scenario_id, raster_path
+        FROM results.connected_flood_depth_rasters
+        WHERE study_area_id = :study_area_id
+        ORDER BY scenario_id
+        """
+    )
+    with engine.connect() as conn:
+        rasters = list(conn.execute(raster_query, {"study_area_id": study_area_id}).mappings())
+
+    update_query = text(
+        """
+        UPDATE results.connected_building_flood_impacts
+        SET max_depth_ft = :max_depth_ft
+        WHERE scenario_id = :scenario_id
+          AND study_area_id = :study_area_id
+          AND building_id = :building_id
+        """
+    )
+    for raster in rasters:
+        impacts = gpd.read_postgis(
+            text(
+                """
+                SELECT i.building_id, ST_AsEWKB(b.geom) AS geom
+                FROM results.connected_building_flood_impacts i
+                JOIN processed.buildings b
+                  ON b.study_area_id = i.study_area_id
+                 AND b.building_id = i.building_id
+                WHERE i.scenario_id = :scenario_id
+                  AND i.study_area_id = :study_area_id
+                """
+            ),
+            engine,
+            geom_col="geom",
+            params={"scenario_id": raster["scenario_id"], "study_area_id": study_area_id},
+        ).set_crs(4326, allow_override=True)
+        updates = []
+        with rasterio.open(raster["raster_path"]) as source:
+            for row in impacts.itertuples(index=False):
+                geometry = transform_geom(impacts.crs, source.crs, row.geom.__geo_interface__)
+                values, _ = raster_mask(source, [geometry], crop=True, filled=False, indexes=1)
+                wet = values.compressed()
+                wet = wet[wet > 0]
+                updates.append(
+                    {
+                        "scenario_id": raster["scenario_id"],
+                        "study_area_id": study_area_id,
+                        "building_id": row.building_id,
+                        "max_depth_ft": float(wet.max()) if wet.size else None,
+                    }
+                )
+        with engine.begin() as conn:
+            for start in range(0, len(updates), 5000):
+                conn.execute(update_query, updates[start : start + 5000])
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DELETE FROM results.connected_building_flood_impacts
+                WHERE study_area_id = :study_area_id
+                  AND max_depth_ft IS NULL
+                """
+            ),
+            {"study_area_id": study_area_id},
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE results.connected_building_exposure_summary s
+                SET flooded_building_count = totals.building_count,
+                    flooded_footprint_area_m2 = totals.flooded_area_m2,
+                    created_at = now()
+                FROM (
+                    SELECT scenario_id, count(*) AS building_count,
+                           coalesce(sum(flooded_area_m2), 0) AS flooded_area_m2
+                    FROM results.connected_building_flood_impacts
+                    WHERE study_area_id = :study_area_id
+                    GROUP BY scenario_id
+                ) totals
+                WHERE s.study_area_id = :study_area_id
+                  AND s.scenario_id = totals.scenario_id
+                """
+            ),
+            {"study_area_id": study_area_id},
+        )
 
 
 def connected_building_exposure_summary(engine: Engine, study_area_id: str) -> list[dict]:
@@ -564,7 +676,7 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         text(
             """
             SELECT i.scenario_id, i.building_id, i.name, i.building_type,
-                   i.footprint_area_m2, i.flooded_area_m2, i.flooded_area_fraction,
+                   i.footprint_area_m2, i.flooded_area_m2, i.flooded_area_fraction, i.max_depth_ft,
                    ST_AsEWKB(b.geom) AS geom
             FROM results.connected_building_flood_impacts i
             JOIN processed.buildings b
@@ -590,3 +702,15 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         buildings.to_file(output_path, layer="buildings", driver="GPKG")
     if not building_impacts.empty:
         building_impacts.to_file(output_path, layer="connected_building_flood_impacts", driver="GPKG")
+    road_summary = pd.read_sql(
+        text("SELECT * FROM results.connected_road_exposure_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+        engine,
+        params={"study_area_id": study_area_id},
+    )
+    building_summary = pd.read_sql(
+        text("SELECT * FROM results.connected_building_exposure_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+        engine,
+        params={"study_area_id": study_area_id},
+    )
+    road_summary.to_csv(output_path.with_name(f"{output_path.stem}_road_summary.csv"), index=False)
+    building_summary.to_csv(output_path.with_name(f"{output_path.stem}_building_summary.csv"), index=False)

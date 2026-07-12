@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-results", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=Path("data/raw/usgs_3dep"))
     parser.add_argument("--title-contains", help="Keep only products whose title contains this text.")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent downloads.")
     parser.add_argument("--download", action="store_true", help="Download the latest GeoTIFF for each intersecting tile.")
     return parser.parse_args()
 
@@ -36,7 +37,7 @@ def main() -> None:
     for product in latest:
         print(f"{product.get('title')} | {product.get('sizeInBytes')} bytes | {product.get('downloadURL')}")
     if args.download:
-        paths = download_products(latest, args.output_dir)
+        paths = download_products(latest, args.output_dir, args.workers)
         for path in paths:
             print(f"downloaded={path}")
 

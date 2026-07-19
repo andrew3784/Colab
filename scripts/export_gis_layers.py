@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from flood_analysis.db import get_engine
+from flood_analysis.db import get_engine, init_db
 from flood_analysis.exposure import export_road_impacts
 
 
@@ -16,7 +16,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    export_road_impacts(get_engine(), args.study_area_id, args.output)
+    engine = get_engine()
+    init_db(engine)
+    export_road_impacts(engine, args.study_area_id, args.output)
     print(f"exported={args.output}")
 
 

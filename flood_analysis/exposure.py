@@ -352,6 +352,9 @@ def calculate_connected_building_flood_impacts(engine: Engine, study_area_id: st
                     FROM processed.buildings b
                     JOIN processed.connected_flood_extents e
                       ON ST_Intersects(b.geom, e.geom)
+                    JOIN results.connected_flood_depth_rasters r
+                      ON r.scenario_id = e.scenario_id
+                     AND r.study_area_id = b.study_area_id
                     WHERE b.study_area_id = :study_area_id
                 )
                 INSERT INTO results.connected_building_flood_impacts (
@@ -393,7 +396,12 @@ def calculate_connected_building_flood_impacts(engine: Engine, study_area_id: st
                 LEFT JOIN results.connected_building_flood_impacts i
                     ON i.scenario_id = s.scenario_id
                     AND i.study_area_id = :study_area_id
-                WHERE EXISTS (SELECT 1 FROM processed.connected_flood_extents e WHERE e.scenario_id = s.scenario_id)
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM results.connected_flood_depth_rasters r
+                    WHERE r.scenario_id = s.scenario_id
+                      AND r.study_area_id = :study_area_id
+                )
                 GROUP BY s.scenario_id
                 """
             ),
@@ -518,6 +526,7 @@ def calculate_road_flood_impacts_for_extent_source(
         raise RuntimeError(f"Unsupported impact table {impact_table}")
     if summary_table not in {"results.road_exposure_summary", "results.connected_road_exposure_summary"}:
         raise RuntimeError(f"Unsupported summary table {summary_table}")
+    raster_table = "results.connected_flood_depth_rasters" if extent_table == "processed.connected_flood_extents" else "results.flood_depth_rasters"
     with engine.begin() as conn:
         conn.execute(text(f"DELETE FROM {impact_table} WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
         conn.execute(text(f"DELETE FROM {summary_table} WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
@@ -540,6 +549,9 @@ def calculate_road_flood_impacts_for_extent_source(
                 FROM processed.roads r
                 JOIN {extent_table} e
                     ON ST_Intersects(r.geom, e.geom)
+                JOIN {raster_table} fr
+                    ON fr.scenario_id = e.scenario_id
+                    AND fr.study_area_id = r.study_area_id
                 WHERE r.study_area_id = :study_area_id
                     AND NOT ST_IsEmpty(ST_Intersection(r.geom, e.geom))
                     AND ST_Length(ST_CollectionExtract(ST_Intersection(r.geom, e.geom), 2)::geography) > 0
@@ -566,7 +578,12 @@ def calculate_road_flood_impacts_for_extent_source(
                 LEFT JOIN {impact_table} i
                     ON i.scenario_id = s.scenario_id
                     AND i.study_area_id = :study_area_id
-                WHERE EXISTS (SELECT 1 FROM {extent_table} e WHERE e.scenario_id = s.scenario_id)
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM {raster_table} fr
+                    WHERE fr.scenario_id = s.scenario_id
+                      AND fr.study_area_id = :study_area_id
+                )
                 GROUP BY s.scenario_id
                 """
             ),
@@ -611,22 +628,30 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     extents = gpd.read_postgis(
         text(
             """
-            SELECT scenario_id, min_depth_ft, max_depth_ft, ST_AsEWKB(geom) AS geom
-            FROM processed.flood_extents
+            SELECT e.scenario_id, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
+            FROM processed.flood_extents e
+            JOIN results.flood_depth_rasters r
+              ON r.scenario_id = e.scenario_id
+            WHERE r.study_area_id = :study_area_id
             """
         ),
         engine,
         geom_col="geom",
+        params={"study_area_id": study_area_id},
     ).set_crs(4326, allow_override=True)
     connected_extents = gpd.read_postgis(
         text(
             """
-            SELECT scenario_id, min_depth_ft, max_depth_ft, ST_AsEWKB(geom) AS geom
-            FROM processed.connected_flood_extents
+            SELECT e.scenario_id, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
+            FROM processed.connected_flood_extents e
+            JOIN results.connected_flood_depth_rasters r
+              ON r.scenario_id = e.scenario_id
+            WHERE r.study_area_id = :study_area_id
             """
         ),
         engine,
         geom_col="geom",
+        params={"study_area_id": study_area_id},
     ).set_crs(4326, allow_override=True)
     impacts = gpd.read_postgis(
         text(
@@ -689,6 +714,25 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         geom_col="geom",
         params={"study_area_id": study_area_id},
     ).set_crs(4326, allow_override=True)
+    building_damage = gpd.read_postgis(
+        text(
+            """
+            SELECT d.scenario_id, d.building_id, d.name, d.building_type,
+                   d.max_depth_ft, d.flooded_area_fraction, d.damage_class,
+                   d.estimated_damage_fraction, d.estimated_damage_cost,
+                   d.recovery_class, d.estimated_recovery_days,
+                   ST_AsEWKB(b.geom) AS geom
+            FROM results.connected_building_damage_estimates d
+            JOIN processed.buildings b
+                ON b.study_area_id = d.study_area_id
+                AND b.building_id = d.building_id
+            WHERE d.study_area_id = :study_area_id
+            """
+        ),
+        engine,
+        geom_col="geom",
+        params={"study_area_id": study_area_id},
+    ).set_crs(4326, allow_override=True)
     if output_path.exists():
         output_path.unlink()
     roads.to_file(output_path, layer="roads", driver="GPKG")
@@ -702,6 +746,8 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         buildings.to_file(output_path, layer="buildings", driver="GPKG")
     if not building_impacts.empty:
         building_impacts.to_file(output_path, layer="connected_building_flood_impacts", driver="GPKG")
+    if not building_damage.empty:
+        building_damage.to_file(output_path, layer="connected_building_damage_estimates", driver="GPKG")
     road_summary = pd.read_sql(
         text("SELECT * FROM results.connected_road_exposure_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
         engine,
@@ -712,5 +758,11 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         engine,
         params={"study_area_id": study_area_id},
     )
+    damage_summary = pd.read_sql(
+        text("SELECT * FROM results.connected_building_damage_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+        engine,
+        params={"study_area_id": study_area_id},
+    )
     road_summary.to_csv(output_path.with_name(f"{output_path.stem}_road_summary.csv"), index=False)
     building_summary.to_csv(output_path.with_name(f"{output_path.stem}_building_summary.csv"), index=False)
+    damage_summary.to_csv(output_path.with_name(f"{output_path.stem}_damage_summary.csv"), index=False)

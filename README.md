@@ -19,6 +19,7 @@ The active Norfolk workflow produces:
 - Four connectivity-filtered flood-depth GeoTIFFs and vector flood extents.
 - TIGER road exposure tables and summaries.
 - Overture building-footprint exposure tables and summaries.
+- Screening-level building damage-cost and recovery-time estimates.
 - A GeoPackage and summary CSV files for GIS review.
 
 ## Before You Start
@@ -383,7 +384,30 @@ current peak: flooded_building_count=169  flooded_footprint_area_m2=133363.3
 
 Each reported building has a positive maximum depth sampled from its connected 1-meter raster. Polygon-only sliver contacts without a wet raster pixel are excluded.
 
-## 11. Export GIS Deliverables
+## 11. Estimate Building Damage
+
+After connected building exposure exists, estimate screening-level structure damage costs and recovery categories:
+
+```bash
+python scripts/calculate_building_damage.py \
+  --study-area-id norfolk_va \
+  --replacement-cost-per-sqft 175
+```
+
+This writes feature-level estimates to `results.connected_building_damage_estimates` and scenario summaries to `results.connected_building_damage_summary`.
+
+The default model is intentionally simple and explainable for project comparison:
+
+```text
+max_depth_ft < 1: minor damage,    5% damage, estimated recovery in days
+1-3 ft:           moderate damage, 20% damage, estimated recovery in weeks
+3-6 ft:           major damage,    40% damage, estimated recovery in months
+>6 ft:            severe damage,   60% damage, extended recovery
+```
+
+Estimated damage cost is calculated from footprint area, the assumed replacement cost per square foot, flooded footprint fraction, and the depth-based damage percentage. Treat this as a screening-level comparison metric, not an appraisal, insurance estimate, or engineering loss assessment.
+
+## 12. Export GIS Deliverables
 
 Export GIS layers for ArcGIS or QGIS review:
 
@@ -403,9 +427,172 @@ connected_flood_extents
 connected_road_flood_impacts
 buildings
 connected_building_flood_impacts
+connected_building_damage_estimates
 ```
 
-The export also writes adjacent road and building scenario-summary CSV files.
+The export also writes adjacent road, building, and damage scenario-summary CSV files.
+
+## 13. Export Regional Comparison
+
+After one or more study areas have road, building, or damage summaries, export a cross-area comparison table:
+
+```bash
+python scripts/export_regional_comparison.py \
+  --output data/processed/gis/regional_flood_comparison.csv
+```
+
+The output compares each available study area and scenario using:
+
+- building count
+- flooded building count
+- flooded building fraction
+- road count
+- flooded road count
+- flooded road miles
+- damaged building count
+- estimated damage cost
+- average damage cost
+- maximum estimated recovery days
+
+The regional analysis is intentionally frozen at seven major Hampton Roads cities: Norfolk, Virginia Beach, Chesapeake, Hampton, Newport News, Portsmouth, and Suffolk. This keeps the project scope large enough for comparison while avoiding a data-processing-only project.
+
+Export presentation-ready tables after the regional comparison has been generated:
+
+```bash
+python scripts/export_presentation_outputs.py \
+  --output-dir data/processed/gis \
+  --top-road-limit 10
+```
+
+This writes:
+
+- `regional_flood_comparison.csv`
+- `regional_top_impacted_roads.csv`
+- `regional_chart_damage_by_city_scenario.csv`
+- `regional_chart_flooded_buildings_by_city_scenario.csv`
+- `regional_chart_flooded_road_miles_by_city_scenario.csv`
+- `regional_chart_exposed_property_value_by_city_scenario.csv`
+- `regional_chart_plus_3ft_summary.csv`
+- `regional_metric_summary.csv`
+- `regional_plus_3ft_metric_summary.csv`
+
+To add Census ACS median-home-value exposure estimates to the regional outputs:
+
+```bash
+python scripts/calculate_property_value_exposure.py --year 2023
+python scripts/export_presentation_outputs.py --output-dir data/processed/gis
+```
+
+The property-value estimate uses Census Reporter / ACS table `B25077` median owner-occupied home value for each city/county-equivalent. It estimates exposed residential property value as median home value multiplied by flooded building area fraction. This is a uniform 7-city proxy, not parcel-level assessed value.
+
+Current `+3 ft` regional summary:
+
+```text
+City               Buildings  Road miles  Damage   Exposed property value
+Norfolk                 1773       43.97  $205.1M                 $355.0M
+Virginia Beach           589      152.59   $45.0M                 $227.9M
+Chesapeake               148       41.42   $23.0M                  $55.2M
+Hampton                  241       60.84   $15.7M                  $61.9M
+Newport News              58       33.06   $14.8M                  $15.1M
+Portsmouth                20       12.17    $2.0M                   $4.9M
+Suffolk                   11       12.74    $1.4M                   $4.0M
+```
+
+Current `+3 ft` seven-city aggregate metrics:
+
+```text
+Metric                         Total        Mean/city    Median/city   Min/city     Max/city
+Flooded buildings              2,840          405.7          148.0        11.0       1,773.0
+Flooded road count             2,479          354.1          291.0        99.0         942.0
+Flooded road miles            356.79          50.97          41.42       12.17        152.59
+Estimated damage            $307.0M         $43.9M         $15.7M       $1.4M       $205.1M
+Exposed property value       $723.9M        $103.4M         $55.2M       $4.0M       $355.0M
+```
+
+Presentation story:
+
+- Norfolk has the highest estimated building damage and flooded building count in the current outputs.
+- Virginia Beach has the highest flooded road mileage under the `+3 ft` scenario.
+- Chesapeake, Hampton, and Newport News show meaningful regional exposure even with fewer damaged buildings than Norfolk or Virginia Beach.
+- Portsmouth and Suffolk have lower building-damage totals in this screening run, but still show measurable road disruption.
+
+Regional comparison caveats:
+
+- Norfolk uses the high-resolution 1-meter DEM workflow; the other six cities currently use the coarse regional DEM workflow.
+- The coarse regional workflow is appropriate for comparison and presentation tables, not parcel-level engineering conclusions.
+- The connected flood outputs are static inundation screening products, not a hydrodynamic flood simulation.
+- The building-damage estimates use a simple depth-based replacement-cost model and should not be treated as insurance, appraisal, or engineering loss estimates.
+- The property-value exposure estimate uses city-level ACS median home values. It is a neighborhood-scale proxy and does not represent parcel assessments, sale prices, commercial property values, or tax appraisals.
+- All current regional scenarios use Sewells Point station datum conversion. A production regional model should evaluate spatially varying tidal datums or VDatum.
+
+To register Hampton Roads locality boundaries in one command:
+
+```bash
+python scripts/ingest_hampton_roads_study_areas.py
+```
+
+For the frozen seven-city regional scope, ingest boundaries plus TIGER roads:
+
+```bash
+python scripts/ingest_hampton_roads_study_areas.py \
+  --only norfolk_va virginia_beach_va chesapeake_va hampton_va newport_news_va portsmouth_va suffolk_va \
+  --include-roads
+```
+
+If a road ingest is slow or interrupted, rerun one locality at a time:
+
+```bash
+python scripts/ingest_roads.py --study-area-id virginia_beach_va --geoid 51810
+python scripts/ingest_roads.py --study-area-id chesapeake_va --geoid 51550
+python scripts/ingest_roads.py --study-area-id portsmouth_va --geoid 51740
+python scripts/ingest_roads.py --study-area-id hampton_va --geoid 51650
+python scripts/ingest_roads.py --study-area-id newport_news_va --geoid 51700
+python scripts/ingest_roads.py --study-area-id suffolk_va --geoid 51800
+```
+
+Study-area and road ingestion only creates the regional inventory. Each locality still needs its own DEM clip, flood rasters, connected flood extents, building footprints, exposure calculation, and damage calculation before it appears in the regional flood-impact comparison.
+
+For a fast end-to-end regional proof of concept, run the coarse workflow for the first batch:
+
+```bash
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id portsmouth_va
+
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id chesapeake_va
+
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id virginia_beach_va
+
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id hampton_va
+
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id newport_news_va
+
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id suffolk_va
+```
+
+This creates city-specific scenarios, downloads and clips coarse USGS DEM tiles, creates flood-depth rasters, creates connected extents, calculates connected road exposure, downloads Overture buildings, calculates building exposure, estimates damage, and refreshes `data/processed/gis/regional_flood_comparison.csv`.
+
+Use these coarse regional outputs for comparison and presentation tables. Use the 1-meter workflow for final high-confidence maps or building-level conclusions.
+
+Useful Hampton Roads Census county-equivalent GEOIDs for `scripts/ingest_study_area.py` and `scripts/ingest_roads.py`:
+
+```text
+Norfolk:              51710
+Virginia Beach:       51810
+Chesapeake:           51550
+Portsmouth:           51740
+Hampton:              51650
+Newport News:         51700
+Suffolk:              51800
+Poquoson:             51735
+York County:          51199
+James City County:    51095
+Isle of Wight County: 51093
+```
 
 ## Optional Coarse Baseline Workflow
 

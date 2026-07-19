@@ -172,6 +172,17 @@ CREATE TABLE IF NOT EXISTS processed.buildings (
 CREATE INDEX IF NOT EXISTS buildings_geom_idx
     ON processed.buildings USING gist (geom);
 
+CREATE TABLE IF NOT EXISTS processed.acs_median_home_values (
+    study_area_id text NOT NULL REFERENCES processed.study_areas(study_area_id),
+    geoid text NOT NULL,
+    year integer NOT NULL,
+    name text NOT NULL,
+    median_home_value double precision,
+    source text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (study_area_id, year)
+);
+
 CREATE TABLE IF NOT EXISTS results.road_flood_impacts (
     scenario_id text NOT NULL REFERENCES processed.flood_scenarios(scenario_id),
     study_area_id text NOT NULL REFERENCES processed.study_areas(study_area_id),
@@ -248,4 +259,48 @@ CREATE TABLE IF NOT EXISTS results.connected_building_exposure_summary (
     flooded_footprint_area_m2 double precision NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scenario_id, study_area_id)
+);
+
+CREATE TABLE IF NOT EXISTS results.connected_building_damage_estimates (
+    scenario_id text NOT NULL REFERENCES processed.flood_scenarios(scenario_id),
+    study_area_id text NOT NULL REFERENCES processed.study_areas(study_area_id),
+    building_id text NOT NULL,
+    name text,
+    building_type text,
+    max_depth_ft double precision NOT NULL,
+    flooded_area_fraction double precision NOT NULL,
+    footprint_area_m2 double precision NOT NULL,
+    replacement_cost_per_sqft double precision NOT NULL,
+    estimated_structure_value double precision NOT NULL,
+    damage_class text NOT NULL,
+    estimated_damage_fraction double precision NOT NULL,
+    estimated_damage_cost double precision NOT NULL,
+    recovery_class text NOT NULL,
+    estimated_recovery_days integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (scenario_id, study_area_id, building_id),
+    FOREIGN KEY (scenario_id, study_area_id, building_id)
+        REFERENCES results.connected_building_flood_impacts(scenario_id, study_area_id, building_id)
+);
+
+CREATE TABLE IF NOT EXISTS results.connected_building_damage_summary (
+    scenario_id text NOT NULL REFERENCES processed.flood_scenarios(scenario_id),
+    study_area_id text NOT NULL REFERENCES processed.study_areas(study_area_id),
+    damaged_building_count bigint NOT NULL,
+    estimated_damage_cost double precision NOT NULL,
+    average_damage_cost double precision NOT NULL,
+    max_estimated_recovery_days integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (scenario_id, study_area_id)
+);
+
+CREATE TABLE IF NOT EXISTS results.property_value_exposure_summary (
+    scenario_id text NOT NULL REFERENCES processed.flood_scenarios(scenario_id),
+    study_area_id text NOT NULL REFERENCES processed.study_areas(study_area_id),
+    acs_year integer NOT NULL,
+    median_home_value double precision,
+    flooded_building_count bigint NOT NULL,
+    estimated_exposed_property_value double precision NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (scenario_id, study_area_id, acs_year)
 );

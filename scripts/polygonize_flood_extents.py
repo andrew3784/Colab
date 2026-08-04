@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polygonize registered flood-depth rasters into processed.flood_extents.")
     parser.add_argument("--scenario-id", action="append", help="Limit processing to one scenario. Repeat for multiple.")
     parser.add_argument("--min-depth-ft", type=float, default=0.0)
+    parser.add_argument("--target-resolution", type=float, help="Optional polygonization resolution in raster units.")
     return parser.parse_args()
 
 
@@ -43,7 +44,13 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No registered flood-depth rasters found. Run scripts/create_flood_depth_rasters.py first.")
     for row in rows:
-        polygon_count = polygonize_depth_raster(engine, row["scenario_id"], Path(row["raster_path"]), args.min_depth_ft)
+        polygon_count = polygonize_depth_raster(
+            engine,
+            row["scenario_id"],
+            Path(row["raster_path"]),
+            args.min_depth_ft,
+            args.target_resolution,
+        )
         print(f"scenario_id={row['scenario_id']} source_polygons={polygon_count}")
 
 

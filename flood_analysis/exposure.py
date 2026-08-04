@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from flood_analysis.rasters import read_study_area
+from flood_analysis.scenario_sets import add_scenario_metadata
 
 
 TIGER_ROADS_URL_TEMPLATE = "https://www2.census.gov/geo/tiger/TIGER2023/ROADS/tl_2023_{geoid}_roads.zip"
@@ -291,6 +292,11 @@ def upsert_buildings(engine: Engine, study_area_id: str, buildings: gpd.GeoDataF
         """
     )
     with engine.begin() as conn:
+        conn.execute(text("DELETE FROM results.connected_building_damage_estimates WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
+        conn.execute(text("DELETE FROM results.connected_building_damage_summary WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
+        conn.execute(text("DELETE FROM results.property_value_exposure_summary WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
+        conn.execute(text("DELETE FROM results.connected_building_flood_impacts WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
+        conn.execute(text("DELETE FROM results.connected_building_exposure_summary WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
         conn.execute(text("DELETE FROM processed.buildings WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
         batch = []
         for row in buildings.itertuples(index=False):
@@ -335,6 +341,14 @@ def calculate_connected_road_flood_impacts(engine: Engine, study_area_id: str) -
 
 def calculate_connected_building_flood_impacts(engine: Engine, study_area_id: str) -> list[dict]:
     with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM results.connected_building_damage_estimates WHERE study_area_id = :study_area_id"),
+            {"study_area_id": study_area_id},
+        )
+        conn.execute(
+            text("DELETE FROM results.connected_building_damage_summary WHERE study_area_id = :study_area_id"),
+            {"study_area_id": study_area_id},
+        )
         conn.execute(text("DELETE FROM results.connected_building_flood_impacts WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
         conn.execute(text("DELETE FROM results.connected_building_exposure_summary WHERE study_area_id = :study_area_id"), {"study_area_id": study_area_id})
         conn.execute(
@@ -628,8 +642,10 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     extents = gpd.read_postgis(
         text(
             """
-            SELECT e.scenario_id, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
+            SELECT e.scenario_id, s.sea_level_rise_ft, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
             FROM processed.flood_extents e
+            JOIN processed.flood_scenarios s
+              ON s.scenario_id = e.scenario_id
             JOIN results.flood_depth_rasters r
               ON r.scenario_id = e.scenario_id
             WHERE r.study_area_id = :study_area_id
@@ -642,8 +658,10 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     connected_extents = gpd.read_postgis(
         text(
             """
-            SELECT e.scenario_id, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
+            SELECT e.scenario_id, s.sea_level_rise_ft, e.min_depth_ft, e.max_depth_ft, ST_AsEWKB(e.geom) AS geom
             FROM processed.connected_flood_extents e
+            JOIN processed.flood_scenarios s
+              ON s.scenario_id = e.scenario_id
             JOIN results.connected_flood_depth_rasters r
               ON r.scenario_id = e.scenario_id
             WHERE r.study_area_id = :study_area_id
@@ -656,9 +674,11 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     impacts = gpd.read_postgis(
         text(
             """
-            SELECT i.scenario_id, i.road_id, i.fullname, i.mtfcc, i.flooded_length_m, i.flooded_length_mi,
+            SELECT i.scenario_id, s.sea_level_rise_ft, i.road_id, i.fullname, i.mtfcc, i.flooded_length_m, i.flooded_length_mi,
                    ST_AsEWKB(r.geom) AS geom
             FROM results.road_flood_impacts i
+            JOIN processed.flood_scenarios s
+                ON s.scenario_id = i.scenario_id
             JOIN processed.roads r
                 ON r.study_area_id = i.study_area_id
                 AND r.road_id = i.road_id
@@ -672,9 +692,11 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     connected_impacts = gpd.read_postgis(
         text(
             """
-            SELECT i.scenario_id, i.road_id, i.fullname, i.mtfcc, i.flooded_length_m, i.flooded_length_mi,
+            SELECT i.scenario_id, s.sea_level_rise_ft, i.road_id, i.fullname, i.mtfcc, i.flooded_length_m, i.flooded_length_mi,
                    ST_AsEWKB(r.geom) AS geom
             FROM results.connected_road_flood_impacts i
+            JOIN processed.flood_scenarios s
+                ON s.scenario_id = i.scenario_id
             JOIN processed.roads r
                 ON r.study_area_id = i.study_area_id
                 AND r.road_id = i.road_id
@@ -700,10 +722,12 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     building_impacts = gpd.read_postgis(
         text(
             """
-            SELECT i.scenario_id, i.building_id, i.name, i.building_type,
+            SELECT i.scenario_id, s.sea_level_rise_ft, i.building_id, i.name, i.building_type,
                    i.footprint_area_m2, i.flooded_area_m2, i.flooded_area_fraction, i.max_depth_ft,
                    ST_AsEWKB(b.geom) AS geom
             FROM results.connected_building_flood_impacts i
+            JOIN processed.flood_scenarios s
+                ON s.scenario_id = i.scenario_id
             JOIN processed.buildings b
                 ON b.study_area_id = i.study_area_id
                 AND b.building_id = i.building_id
@@ -717,12 +741,14 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
     building_damage = gpd.read_postgis(
         text(
             """
-            SELECT d.scenario_id, d.building_id, d.name, d.building_type,
+            SELECT d.scenario_id, s.sea_level_rise_ft, d.building_id, d.name, d.building_type,
                    d.max_depth_ft, d.flooded_area_fraction, d.damage_class,
                    d.estimated_damage_fraction, d.estimated_damage_cost,
                    d.recovery_class, d.estimated_recovery_days,
                    ST_AsEWKB(b.geom) AS geom
             FROM results.connected_building_damage_estimates d
+            JOIN processed.flood_scenarios s
+                ON s.scenario_id = d.scenario_id
             JOIN processed.buildings b
                 ON b.study_area_id = d.study_area_id
                 AND b.building_id = d.building_id
@@ -733,6 +759,12 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         geom_col="geom",
         params={"study_area_id": study_area_id},
     ).set_crs(4326, allow_override=True)
+    extents = add_scenario_metadata(extents)
+    connected_extents = add_scenario_metadata(connected_extents)
+    impacts = add_scenario_metadata(impacts)
+    connected_impacts = add_scenario_metadata(connected_impacts)
+    building_impacts = add_scenario_metadata(building_impacts)
+    building_damage = add_scenario_metadata(building_damage)
     if output_path.exists():
         output_path.unlink()
     roads.to_file(output_path, layer="roads", driver="GPKG")
@@ -748,21 +780,45 @@ def export_road_impacts(engine: Engine, study_area_id: str, output_path: Path) -
         building_impacts.to_file(output_path, layer="connected_building_flood_impacts", driver="GPKG")
     if not building_damage.empty:
         building_damage.to_file(output_path, layer="connected_building_damage_estimates", driver="GPKG")
-    road_summary = pd.read_sql(
-        text("SELECT * FROM results.connected_road_exposure_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+    road_summary = add_scenario_metadata(pd.read_sql(
+        text(
+            """
+            SELECT rs.*, s.sea_level_rise_ft
+            FROM results.connected_road_exposure_summary rs
+            JOIN processed.flood_scenarios s ON s.scenario_id = rs.scenario_id
+            WHERE rs.study_area_id = :study_area_id
+            ORDER BY s.sea_level_rise_ft, rs.scenario_id
+            """
+        ),
         engine,
         params={"study_area_id": study_area_id},
-    )
-    building_summary = pd.read_sql(
-        text("SELECT * FROM results.connected_building_exposure_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+    ))
+    building_summary = add_scenario_metadata(pd.read_sql(
+        text(
+            """
+            SELECT bs.*, s.sea_level_rise_ft
+            FROM results.connected_building_exposure_summary bs
+            JOIN processed.flood_scenarios s ON s.scenario_id = bs.scenario_id
+            WHERE bs.study_area_id = :study_area_id
+            ORDER BY s.sea_level_rise_ft, bs.scenario_id
+            """
+        ),
         engine,
         params={"study_area_id": study_area_id},
-    )
-    damage_summary = pd.read_sql(
-        text("SELECT * FROM results.connected_building_damage_summary WHERE study_area_id = :study_area_id ORDER BY scenario_id"),
+    ))
+    damage_summary = add_scenario_metadata(pd.read_sql(
+        text(
+            """
+            SELECT ds.*, s.sea_level_rise_ft
+            FROM results.connected_building_damage_summary ds
+            JOIN processed.flood_scenarios s ON s.scenario_id = ds.scenario_id
+            WHERE ds.study_area_id = :study_area_id
+            ORDER BY s.sea_level_rise_ft, ds.scenario_id
+            """
+        ),
         engine,
         params={"study_area_id": study_area_id},
-    )
+    ))
     road_summary.to_csv(output_path.with_name(f"{output_path.stem}_road_summary.csv"), index=False)
     building_summary.to_csv(output_path.with_name(f"{output_path.stem}_building_summary.csv"), index=False)
     damage_summary.to_csv(output_path.with_name(f"{output_path.stem}_damage_summary.csv"), index=False)

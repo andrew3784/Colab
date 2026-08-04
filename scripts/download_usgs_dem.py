@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search or download USGS 3DEP DEM GeoTIFFs for a study area.")
     parser.add_argument("--study-area-id", default="norfolk_va")
     parser.add_argument("--dataset", default=DEFAULT_DEM_DATASET)
+    parser.add_argument("--product-formats", default="GeoTIFF")
     parser.add_argument("--max-results", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=Path("data/raw/usgs_3dep"))
     parser.add_argument("--title-contains", help="Keep only products whose title contains this text.")
@@ -27,7 +28,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    products = search_tnm_dem_products(get_engine(), args.study_area_id, args.dataset, args.max_results)
+    products = search_tnm_dem_products(get_engine(), args.study_area_id, args.dataset, args.max_results, args.product_formats)
     filtered = filter_products_by_title(products, args.title_contains)
     latest = latest_products_per_tile(filtered)
     if not latest:

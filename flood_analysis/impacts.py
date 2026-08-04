@@ -6,6 +6,8 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from flood_analysis.scenario_sets import add_scenario_metadata
+
 
 SQFT_PER_M2 = 10.76391041671
 REGIONAL_STUDY_AREA_IDS = [
@@ -184,7 +186,7 @@ def export_regional_comparison(engine: Engine, output_path: Path, study_area_ids
         ORDER BY sa.name, s.sea_level_rise_ft, s.scenario_id
         """
     )
-    frame = pd.read_sql(query, engine, params={"study_area_ids": study_area_ids})
+    frame = add_scenario_metadata(pd.read_sql(query, engine, params={"study_area_ids": study_area_ids}))
     frame.to_csv(output_path, index=False)
     return frame
 
@@ -222,10 +224,12 @@ def export_top_impacted_roads(engine: Engine, output_path: Path, limit_per_group
         ORDER BY study_area_name, sea_level_rise_ft, rank
         """
     )
-    frame = pd.read_sql(
-        query,
-        engine,
-        params={"study_area_ids": REGIONAL_STUDY_AREA_IDS, "limit_per_group": limit_per_group},
+    frame = add_scenario_metadata(
+        pd.read_sql(
+            query,
+            engine,
+            params={"study_area_ids": REGIONAL_STUDY_AREA_IDS, "limit_per_group": limit_per_group},
+        )
     )
     frame.to_csv(output_path, index=False)
     return frame
@@ -238,7 +242,12 @@ def export_regional_chart_tables(comparison: pd.DataFrame, output_dir: Path) -> 
         "flooded_buildings_by_city_scenario": output_dir / "regional_chart_flooded_buildings_by_city_scenario.csv",
         "flooded_road_miles_by_city_scenario": output_dir / "regional_chart_flooded_road_miles_by_city_scenario.csv",
         "exposed_property_value_by_city_scenario": output_dir / "regional_chart_exposed_property_value_by_city_scenario.csv",
+        "all_slr_summary": output_dir / "regional_chart_all_slr_summary.csv",
+        "decade_summary": output_dir / "regional_chart_decade_summary.csv",
+        "year_2100_summary": output_dir / "regional_chart_2100_summary.csv",
         "plus_3ft_summary": output_dir / "regional_chart_plus_3ft_summary.csv",
+        "plus_6ft_summary": output_dir / "regional_chart_plus_6ft_summary.csv",
+        "scenario_lookup": output_dir / "regional_scenario_lookup.csv",
     }
 
     damage = comparison.pivot_table(
@@ -265,14 +274,27 @@ def export_regional_chart_tables(comparison: pd.DataFrame, output_dir: Path) -> 
         values="estimated_exposed_property_value",
         aggfunc="sum",
     ).reset_index()
+    all_slr = comparison.sort_values(["sea_level_rise_ft", "study_area_name"]).copy()
+    decade = all_slr[all_slr["scenario_type"] == "future_decade"].copy()
+    year_2100 = all_slr[all_slr["planning_year"] == 2100].copy()
     plus_3ft = comparison[comparison["sea_level_rise_ft"] == 3.0].copy()
     plus_3ft = plus_3ft.sort_values("estimated_damage_cost", ascending=False)
+    plus_6ft = comparison[comparison["sea_level_rise_ft"] == 6.0].copy()
+    plus_6ft = plus_6ft.sort_values("estimated_damage_cost", ascending=False)
+    scenario_lookup = comparison[
+        ["sea_level_rise_ft", "planning_year", "scenario_type", "scenario_label"]
+    ].drop_duplicates().sort_values("sea_level_rise_ft")
 
     damage.to_csv(paths["damage_by_city_scenario"], index=False)
     buildings.to_csv(paths["flooded_buildings_by_city_scenario"], index=False)
     roads.to_csv(paths["flooded_road_miles_by_city_scenario"], index=False)
     property_value.to_csv(paths["exposed_property_value_by_city_scenario"], index=False)
+    all_slr.to_csv(paths["all_slr_summary"], index=False)
+    decade.to_csv(paths["decade_summary"], index=False)
+    year_2100.to_csv(paths["year_2100_summary"], index=False)
     plus_3ft.to_csv(paths["plus_3ft_summary"], index=False)
+    plus_6ft.to_csv(paths["plus_6ft_summary"], index=False)
+    scenario_lookup.to_csv(paths["scenario_lookup"], index=False)
     return paths
 
 
@@ -281,6 +303,9 @@ def export_regional_metric_summaries(comparison: pd.DataFrame, output_dir: Path)
     paths = {
         "metric_summary": output_dir / "regional_metric_summary.csv",
         "plus_3ft_metric_summary": output_dir / "regional_plus_3ft_metric_summary.csv",
+        "decade_metric_summary": output_dir / "regional_decade_metric_summary.csv",
+        "year_2100_metric_summary": output_dir / "regional_2100_metric_summary.csv",
+        "plus_6ft_metric_summary": output_dir / "regional_plus_6ft_metric_summary.csv",
     }
     metric_columns = [
         "flooded_building_count",
@@ -304,8 +329,15 @@ def export_regional_metric_summaries(comparison: pd.DataFrame, output_dir: Path)
         for column in summary.columns
     ]
     summary = summary.reset_index()
+    summary = add_scenario_metadata(summary)
     plus_3ft = summary[summary["sea_level_rise_ft"] == 3.0].copy()
+    decade = summary[summary["scenario_type"] == "future_decade"].copy()
+    year_2100 = summary[summary["planning_year"] == 2100].copy()
+    plus_6ft = summary[summary["sea_level_rise_ft"] == 6.0].copy()
 
     summary.to_csv(paths["metric_summary"], index=False)
     plus_3ft.to_csv(paths["plus_3ft_metric_summary"], index=False)
+    decade.to_csv(paths["decade_metric_summary"], index=False)
+    year_2100.to_csv(paths["year_2100_metric_summary"], index=False)
+    plus_6ft.to_csv(paths["plus_6ft_metric_summary"], index=False)
     return paths

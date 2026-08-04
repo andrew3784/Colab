@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,8 @@ import requests
 from rasterio.features import shapes
 from rasterio.mask import mask
 from rasterio.merge import merge
-from rasterio.warp import transform_geom
+from rasterio.enums import Resampling
+from rasterio.warp import transform_bounds, transform_geom
 from scipy import ndimage
 from shapely.geometry import shape
 from shapely.ops import unary_union
@@ -60,12 +62,13 @@ def search_tnm_dem_products(
     study_area_id: str,
     dataset: str = DEFAULT_DEM_DATASET,
     max_results: int = 20,
+    product_formats: str = "GeoTIFF",
 ) -> list[dict]:
     bounds = read_study_area(engine, study_area_id).total_bounds
     params = {
         "datasets": dataset,
         "bbox": ",".join(str(value) for value in bounds),
-        "prodFormats": "GeoTIFF",
+        "prodFormats": product_formats,
         "max": str(max_results),
         "outputFormat": "JSON",
     }
@@ -154,14 +157,20 @@ def clip_dem_to_study_area(engine: Engine, study_area_id: str, input_paths: list
             clipped, transform = mask(source, shapes, crop=True, filled=True)
             profile = source.profile.copy()
         else:
-            mosaic, transform = merge(datasets)
+            source_crs = datasets[0].crs
+            source_bounds = transform_bounds(study_area.crs, source_crs, *study_area.total_bounds, densify_pts=21)
             profile = datasets[0].profile.copy()
-            profile.update(height=mosaic.shape[1], width=mosaic.shape[2], transform=transform)
-            with rasterio.io.MemoryFile() as memfile:
-                with memfile.open(**profile) as tmp:
-                    tmp.write(mosaic)
+            profile.update(driver="GTiff", compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
+            with tempfile.NamedTemporaryFile(suffix=".tif", dir=output_path.parent, delete=False) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+            try:
+                merge(datasets, bounds=source_bounds, dst_path=tmp_path, dst_kwds=profile)
+                with rasterio.open(tmp_path) as tmp:
                     shapes = [transform_geom(study_area.crs, tmp.crs, geom.__geo_interface__) for geom in study_area.geometry]
                     clipped, transform = mask(tmp, shapes, crop=True, filled=True)
+                    profile = tmp.profile.copy()
+            finally:
+                tmp_path.unlink(missing_ok=True)
         profile.update(
             driver="GTiff",
             height=clipped.shape[1],
@@ -185,29 +194,38 @@ def flood_depth_from_dem(
     dem_units: str = "meters",
 ) -> DepthStats:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    min_depth: float | None = None
+    max_depth: float | None = None
+    wet_sum = 0.0
+    wet_pixel_count = 0
     with rasterio.open(dem_path) as src:
-        dem = src.read(1, masked=True).astype("float32")
-        if dem_units == "meters":
-            dem_ft = dem * METERS_TO_FEET
-        elif dem_units == "feet":
-            dem_ft = dem
-        else:
+        if dem_units not in {"meters", "feet"}:
             raise RuntimeError("dem_units must be 'meters' or 'feet'")
-        depth = water_surface_elevation_ft - dem_ft
-        depth = np.ma.where(depth > 0, depth, 0.0)
-        depth = np.ma.array(depth, mask=np.ma.getmaskarray(dem))
-        wet = depth.compressed()
-        wet = wet[wet > 0]
-        stats = DepthStats(
-            min_depth_ft=float(wet.min()) if wet.size else None,
-            max_depth_ft=float(wet.max()) if wet.size else None,
-            mean_depth_ft=float(wet.mean()) if wet.size else None,
-            wet_pixel_count=int(wet.size),
-        )
         profile = src.profile.copy()
         profile.update(dtype="float32", nodata=DEPTH_NODATA, compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
         with rasterio.open(output_path, "w", **profile) as dst:
-            dst.write(depth.filled(DEPTH_NODATA).astype("float32"), 1)
+            for _, window in src.block_windows(1):
+                dem = src.read(1, window=window, masked=True).astype("float32")
+                dem_ft = dem * METERS_TO_FEET if dem_units == "meters" else dem
+                depth = water_surface_elevation_ft - dem_ft
+                depth = np.ma.where(depth > 0, depth, 0.0)
+                depth = np.ma.array(depth, mask=np.ma.getmaskarray(dem))
+                wet = depth.compressed()
+                wet = wet[wet > 0]
+                if wet.size:
+                    block_min = float(wet.min())
+                    block_max = float(wet.max())
+                    min_depth = block_min if min_depth is None else min(min_depth, block_min)
+                    max_depth = block_max if max_depth is None else max(max_depth, block_max)
+                    wet_sum += float(wet.sum(dtype=np.float64))
+                    wet_pixel_count += int(wet.size)
+                dst.write(depth.filled(DEPTH_NODATA).astype("float32"), 1, window=window)
+    stats = DepthStats(
+        min_depth_ft=min_depth,
+        max_depth_ft=max_depth,
+        mean_depth_ft=wet_sum / wet_pixel_count if wet_pixel_count else None,
+        wet_pixel_count=wet_pixel_count,
+    )
     return stats
 
 
@@ -235,23 +253,41 @@ def boundary_connected_wet_mask(wet: np.ndarray, valid: np.ndarray) -> np.ndarra
 def connected_depth_raster(source_path: Path, output_path: Path, min_depth_ft: float = 0.0) -> ConnectedDepthStats:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(source_path) as src:
-        depth = src.read(1)
-        valid = depth != src.nodata if src.nodata is not None else np.ones(depth.shape, dtype=bool)
-        wet = valid & (depth > min_depth_ft)
+        valid = np.zeros((src.height, src.width), dtype=bool)
+        wet = np.zeros((src.height, src.width), dtype=bool)
+        for _, window in src.block_windows(1):
+            depth = src.read(1, window=window)
+            block_valid = depth != src.nodata if src.nodata is not None else np.ones(depth.shape, dtype=bool)
+            valid[window.toslices()] = block_valid
+            wet[window.toslices()] = block_valid & (depth > min_depth_ft)
         connected = boundary_connected_wet_mask(wet, valid)
-        filtered = depth.copy()
-        filtered[valid & ~connected] = 0.0
-        wet_values = filtered[connected]
-        stats = DepthStats(
-            min_depth_ft=float(wet_values.min()) if wet_values.size else None,
-            max_depth_ft=float(wet_values.max()) if wet_values.size else None,
-            mean_depth_ft=float(wet_values.mean()) if wet_values.size else None,
-            wet_pixel_count=int(connected.sum()),
-        )
+        min_depth: float | None = None
+        max_depth: float | None = None
+        wet_sum = 0.0
+        wet_pixel_count = 0
         profile = src.profile.copy()
         profile.update(dtype="float32", nodata=DEPTH_NODATA, compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
         with rasterio.open(output_path, "w", **profile) as dst:
-            dst.write(filtered.astype("float32"), 1)
+            for _, window in src.block_windows(1):
+                depth = src.read(1, window=window).astype("float32")
+                window_connected = connected[window.toslices()]
+                window_valid = valid[window.toslices()]
+                depth[window_valid & ~window_connected] = 0.0
+                wet_values = depth[window_connected]
+                if wet_values.size:
+                    block_min = float(wet_values.min())
+                    block_max = float(wet_values.max())
+                    min_depth = block_min if min_depth is None else min(min_depth, block_min)
+                    max_depth = block_max if max_depth is None else max(max_depth, block_max)
+                    wet_sum += float(wet_values.sum(dtype=np.float64))
+                    wet_pixel_count += int(wet_values.size)
+                dst.write(depth, 1, window=window)
+        stats = DepthStats(
+            min_depth_ft=min_depth,
+            max_depth_ft=max_depth,
+            mean_depth_ft=wet_sum / wet_pixel_count if wet_pixel_count else None,
+            wet_pixel_count=wet_pixel_count,
+        )
     return ConnectedDepthStats(depth_stats=stats, removed_wet_pixel_count=int(wet.sum() - connected.sum()))
 
 
@@ -391,12 +427,25 @@ def register_connected_depth_raster(
         )
 
 
-def polygonize_depth_raster(engine: Engine, scenario_id: str, raster_path: Path, min_depth_ft: float = 0.0) -> int:
+def polygonize_depth_raster(
+    engine: Engine,
+    scenario_id: str,
+    raster_path: Path,
+    min_depth_ft: float = 0.0,
+    target_resolution: float | None = None,
+) -> int:
     with rasterio.open(raster_path) as src:
-        depth = src.read(1)
+        transform = src.transform
+        if target_resolution and target_resolution > max(abs(src.res[0]), abs(src.res[1])):
+            out_width = max(1, int(np.ceil(src.width * abs(src.res[0]) / target_resolution)))
+            out_height = max(1, int(np.ceil(src.height * abs(src.res[1]) / target_resolution)))
+            depth = src.read(1, out_shape=(out_height, out_width), resampling=Resampling.average)
+            transform = src.transform * src.transform.scale(src.width / out_width, src.height / out_height)
+        else:
+            depth = src.read(1)
         valid = depth != src.nodata if src.nodata is not None else np.ones(depth.shape, dtype=bool)
         wet = valid & (depth > min_depth_ft)
-        geometries = [shape(geom) for geom, value in shapes(wet.astype("uint8"), mask=wet, transform=src.transform) if value == 1]
+        geometries = [shape(geom) for geom, value in shapes(wet.astype("uint8"), mask=wet, transform=transform) if value == 1]
         if not geometries:
             with engine.begin() as conn:
                 conn.execute(text("DELETE FROM processed.flood_extents WHERE scenario_id = :scenario_id"), {"scenario_id": scenario_id})
@@ -425,12 +474,25 @@ def polygonize_depth_raster(engine: Engine, scenario_id: str, raster_path: Path,
     return len(geometries)
 
 
-def polygonize_connected_depth_raster(engine: Engine, scenario_id: str, raster_path: Path, min_depth_ft: float = 0.0) -> int:
+def polygonize_connected_depth_raster(
+    engine: Engine,
+    scenario_id: str,
+    raster_path: Path,
+    min_depth_ft: float = 0.0,
+    target_resolution: float | None = None,
+) -> int:
     with rasterio.open(raster_path) as src:
-        depth = src.read(1)
+        transform = src.transform
+        if target_resolution and target_resolution > max(abs(src.res[0]), abs(src.res[1])):
+            out_width = max(1, int(np.ceil(src.width * abs(src.res[0]) / target_resolution)))
+            out_height = max(1, int(np.ceil(src.height * abs(src.res[1]) / target_resolution)))
+            depth = src.read(1, out_shape=(out_height, out_width), resampling=Resampling.average)
+            transform = src.transform * src.transform.scale(src.width / out_width, src.height / out_height)
+        else:
+            depth = src.read(1)
         valid = depth != src.nodata if src.nodata is not None else np.ones(depth.shape, dtype=bool)
         wet = valid & (depth > min_depth_ft)
-        geometries = [shape(geom) for geom, value in shapes(wet.astype("uint8"), mask=wet, transform=src.transform) if value == 1]
+        geometries = [shape(geom) for geom, value in shapes(wet.astype("uint8"), mask=wet, transform=transform) if value == 1]
         if not geometries:
             with engine.begin() as conn:
                 conn.execute(text("DELETE FROM processed.connected_flood_extents WHERE scenario_id = :scenario_id"), {"scenario_id": scenario_id})

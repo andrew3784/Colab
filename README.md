@@ -159,6 +159,29 @@ current peak: 1.536 ft NAVD88
 +3 ft SLR:    4.536 ft NAVD88
 ```
 
+Optional expanded flood-view scenario set for flooding on top of sea-level rise:
+
+```text
+0.00 ft, 0.50 ft, 1.00 ft, 1.50 ft, 2.00 ft, 2.50 ft, 3.00 ft, 3.75 ft, 4.00 ft, 4.50 ft, 5.00 ft, 6.00 ft
+```
+
+The decade planning curve for climate-change and sea-level-rise impacts through 2100 is:
+
+```text
+2030: +0.50 ft SLR
+2040: +1.00 ft SLR
+2050: +1.50 ft SLR
+2060: +2.00 ft SLR
+2070: +2.50 ft SLR
+2080: +3.00 ft SLR
+2090: +3.75 ft SLR
+2100: +4.50 ft SLR
+```
+
+The `+4`, `+5`, and `+6 ft` scenarios are additional flood-view stress tests on top of the same event baseline. This keeps the established model: NOAA Sewells Point event peak plus an added sea-level-rise increment, converted to NAVD88 before comparison to the DEM. Treat the decade values as a planning curve for presentation and sensitivity testing. Cite NOAA's 2022 Sea Level Rise Technical Report as the source for scenario-based U.S. sea-level-rise planning; the specific decade values above are a simplified interpolation from the selected planning anchors.
+
+The notebook adds a climate-possibility framing layer on top of these deterministic flood outputs. It labels available scenarios as an observed event benchmark, future sea-level-rise planning possibilities, or stress-test possibilities. This is intentionally not an annual exceedance probability or return-period model; the spatial workflow answers what is exposed if a modeled water surface occurs, not how often that water surface will occur.
+
 ## 4. Ingest Norfolk Study Area
 
 Load the Norfolk city boundary from US Census TIGER/Line county-equivalent boundaries:
@@ -464,6 +487,14 @@ python scripts/export_presentation_outputs.py \
   --top-road-limit 10
 ```
 
+Export the notebook report to HTML without installing TeX/xelatex:
+
+```bash
+python scripts/export_notebook_html.py
+```
+
+This writes `data/processed/gis/cs620_project_efs_report.html`. Open that file in a browser and use the browser's print dialog to save it as a PDF. Direct Jupyter PDF export requires a TeX installation such as `xelatex`.
+
 This writes:
 
 - `regional_flood_comparison.csv`
@@ -472,9 +503,17 @@ This writes:
 - `regional_chart_flooded_buildings_by_city_scenario.csv`
 - `regional_chart_flooded_road_miles_by_city_scenario.csv`
 - `regional_chart_exposed_property_value_by_city_scenario.csv`
+- `regional_chart_all_slr_summary.csv`
+- `regional_chart_decade_summary.csv`
+- `regional_chart_2100_summary.csv`
 - `regional_chart_plus_3ft_summary.csv`
+- `regional_chart_plus_6ft_summary.csv`
 - `regional_metric_summary.csv`
 - `regional_plus_3ft_metric_summary.csv`
+- `regional_decade_metric_summary.csv`
+- `regional_2100_metric_summary.csv`
+- `regional_plus_6ft_metric_summary.csv`
+- `regional_scenario_lookup.csv`
 
 To add Census ACS median-home-value exposure estimates to the regional outputs:
 
@@ -484,6 +523,63 @@ python scripts/export_presentation_outputs.py --output-dir data/processed/gis
 ```
 
 The property-value estimate uses Census Reporter / ACS table `B25077` median owner-occupied home value for each city/county-equivalent. It estimates exposed residential property value as median home value multiplied by flooded building area fraction. This is a uniform 7-city proxy, not parcel-level assessed value.
+
+To run the optional full `0-6 ft` scenario set from the notebook, open `cs620_project_efs.ipynb`, set `RUN_FULL_0_TO_6FT_WORKFLOW = True`, and run the notebook top to bottom. The notebook uses these SLR increments:
+
+```text
+0 0.5 1 1.5 2 2.5 3 3.75 4 4.5 5 6
+```
+
+The same full workflow is available as a resumable terminal-oriented script that logs progress to `data/processed/logs/`:
+
+```bash
+scripts/run_full_0_to_6ft_workflow.sh
+```
+
+If running over SSH, prefer `tmux` or `screen` because the 1-meter Norfolk rasters and city GeoPackage exports can run for a long time.
+
+Manual equivalent for the six coarse regional cities:
+
+```bash
+python scripts/run_regional_coarse_workflow.py \
+  --study-area-id virginia_beach_va \
+  --study-area-id chesapeake_va \
+  --study-area-id hampton_va \
+  --study-area-id newport_news_va \
+  --study-area-id portsmouth_va \
+  --study-area-id suffolk_va \
+  --sea-level-rise-ft 0 0.5 1 1.5 2 2.5 3 3.75 4 4.5 5 6
+```
+
+Norfolk uses the higher-resolution 1-meter workflow, so generate its future scenarios with the standard Norfolk raster/exposure sequence:
+
+```bash
+python scripts/create_peak_scenarios.py \
+  --event-start 2026-06-27T00:00:00Z \
+  --event-end 2026-06-28T23:59:59Z \
+  --study-area "Norfolk pilot" \
+  --sea-level-rise-ft 0 0.5 1 1.5 2 2.5 3 3.75 4 4.5 5 6 \
+  --method "1-meter Norfolk screening; connected flood extents; 0-6 ft SLR views"
+
+python scripts/convert_scenarios_datum.py --station 8638610 --source-datum MLLW --target-datum NAVD88
+
+python scripts/create_flood_depth_rasters.py \
+  --study-area-id norfolk_va \
+  --dem data/processed/dem/norfolk_va_usgs_1m_hamptonroads_b23_navd88_m.tif \
+  --dem-units meters \
+  --output-dir data/processed/flood_depths_1m
+
+python scripts/polygonize_flood_extents.py --min-depth-ft 0
+python scripts/create_connected_flood_depth_rasters.py --output-dir data/processed/flood_depths_connected_1m --min-depth-ft 0
+python scripts/polygonize_connected_flood_extents.py --min-depth-ft 0
+python scripts/calculate_road_exposure.py --study-area-id norfolk_va --connected
+python scripts/calculate_building_exposure.py --study-area-id norfolk_va
+python scripts/calculate_building_damage.py --study-area-id norfolk_va --replacement-cost-per-sqft 175
+python scripts/calculate_property_value_exposure.py --year 2023
+python scripts/export_presentation_outputs.py --output-dir data/processed/gis --top-road-limit 10
+```
+
+After the expanded workflow runs, the notebook adds decade summary, `2100 / +4.5 ft`, and `+6 ft` stress-view result tables using the same report CSVs. GIS GeoPackage scenario layers and adjacent summary CSVs include `sea_level_rise_ft`, `planning_year`, `scenario_type`, and `scenario_label` fields for filtering in QGIS or ArcGIS.
 
 Current `+3 ft` regional summary:
 
@@ -524,6 +620,7 @@ Regional comparison caveats:
 - The building-damage estimates use a simple depth-based replacement-cost model and should not be treated as insurance, appraisal, or engineering loss estimates.
 - The property-value exposure estimate uses city-level ACS median home values. It is a neighborhood-scale proxy and does not represent parcel assessments, sale prices, commercial property values, or tax appraisals.
 - All current regional scenarios use Sewells Point station datum conversion. A production regional model should evaluate spatially varying tidal datums or VDatum.
+- Future decade and `+6 ft` stress-view scenarios use the same static connected-inundation model with larger sea-level-rise increments. They account for flooding on top of the selected sea-level-rise increment, but do not model changing storm climatology, rainfall, drainage capacity, shoreline adaptation, subsidence beyond the SLR increment, or future development patterns.
 
 To register Hampton Roads locality boundaries in one command:
 

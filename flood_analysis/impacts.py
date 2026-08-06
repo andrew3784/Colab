@@ -161,8 +161,8 @@ def export_regional_comparison(engine: Engine, output_path: Path, study_area_ids
             coalesce(ds.estimated_damage_cost, 0) AS estimated_damage_cost,
             coalesce(ds.average_damage_cost, 0) AS average_damage_cost,
             coalesce(ds.max_estimated_recovery_days, 0) AS max_estimated_recovery_days,
-            ps.acs_year AS property_value_acs_year,
-            ps.median_home_value,
+            coalesce(ps.acs_year, av.year) AS property_value_acs_year,
+            coalesce(ps.median_home_value, av.median_home_value) AS median_home_value,
             coalesce(ps.estimated_exposed_property_value, 0) AS estimated_exposed_property_value
         FROM processed.study_areas sa
         CROSS JOIN processed.flood_scenarios s
@@ -178,6 +178,14 @@ def export_regional_comparison(engine: Engine, output_path: Path, study_area_ids
         LEFT JOIN results.property_value_exposure_summary ps
           ON ps.study_area_id = sa.study_area_id
          AND ps.scenario_id = s.scenario_id
+        LEFT JOIN LATERAL (
+            SELECT year, median_home_value
+            FROM processed.acs_median_home_values
+            WHERE study_area_id = sa.study_area_id
+              AND median_home_value IS NOT NULL
+            ORDER BY year DESC
+            LIMIT 1
+        ) av ON true
         WHERE (bs.scenario_id IS NOT NULL
             OR rs.scenario_id IS NOT NULL
             OR ds.scenario_id IS NOT NULL
